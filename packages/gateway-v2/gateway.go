@@ -36,6 +36,7 @@ const (
 	ForwardModeTCP             ForwardMode = "TCP"
 	ForwardModePAM             ForwardMode = "PAM"
 	ForwardModePAMRDPBrowser   ForwardMode = "PAM_RDP_BROWSER"
+	ForwardModePAMWebBrowser   ForwardMode = "PAM_WEB_BROWSER"
 	ForwardModePAMCancellation ForwardMode = "PAM_CANCELLATION"
 	ForwardModePAMCapabilities ForwardMode = "PAM_CAPABILITIES"
 	ForwardModePing            ForwardMode = "PING"
@@ -936,7 +937,7 @@ func (g *Gateway) handleIncomingChannel(newChannel ssh.NewChannel) {
 			log.Info().Msg("TCP proxy handler completed")
 		}
 		return
-	} else if forwardConfig.Mode == ForwardModePAM || forwardConfig.Mode == ForwardModePAMRDPBrowser {
+	} else if forwardConfig.Mode == ForwardModePAM || forwardConfig.Mode == ForwardModePAMRDPBrowser || forwardConfig.Mode == ForwardModePAMWebBrowser {
 		// RDP only: prior bridge must fully tear down before the new one starts,
 		// else overlapping drains write non-monotonic elapsedMs to the recording.
 		if forwardConfig.PAMConfig.ResourceType == session.ResourceTypeWindows {
@@ -1039,6 +1040,10 @@ func (g *Gateway) parseForwardConfigFromALPN(tlsConn *tls.Conn, reader *bufio.Re
 
 	case "infisical-pam-rdp-browser":
 		config.Mode = ForwardModePAMRDPBrowser
+		return config, nil
+
+	case "infisical-pam-web-browser":
+		config.Mode = ForwardModePAMWebBrowser
 		return config, nil
 
 	case "infisical-pam-session-cancellation":
@@ -1236,6 +1241,7 @@ func nextProtosForGateway(pkcs11Loaded bool) []string {
 		"infisical-ping",
 		"infisical-pam-proxy",
 		"infisical-pam-rdp-browser",
+		"infisical-pam-web-browser",
 		"infisical-pam-session-cancellation",
 		"infisical-pam-capabilities",
 		"infisical-adcs",

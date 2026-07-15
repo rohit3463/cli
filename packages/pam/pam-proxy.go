@@ -24,6 +24,7 @@ import (
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/rdp"
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/redis"
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/ssh"
+	"github.com/Infisical/infisical-merge/packages/pam/handlers/webbrowser"
 	"github.com/Infisical/infisical-merge/packages/pam/session"
 	"github.com/Infisical/infisical-merge/packages/util"
 	"github.com/go-resty/resty/v2"
@@ -61,6 +62,7 @@ func GetSupportedResourceTypes() []string {
 		session.ResourceTypeOracledb,
 		session.ResourceTypeGcpServiceAccount,
 		session.ResourceTypeAzureCli,
+		session.ResourceTypeWebApp,
 	}
 	// Only advertise RDP when the real bridge is compiled in. A stub
 	// build would otherwise accept RDP session routing and fail every
@@ -528,6 +530,18 @@ func HandlePAMProxy(ctx context.Context, conn *tls.Conn, pamConfig *GatewayPAMCo
 			Str("sessionId", pamConfig.SessionId).
 			Msg("Starting Azure CLI PAM proxy")
 		return proxy.HandleConnection(ctx, handlerConn)
+	case session.ResourceTypeWebApp:
+		webCfg := webbrowser.Config{
+			TargetURL: credentials.Url,
+			Username:  credentials.Username,
+			Password:  credentials.Password,
+			VerifyTLS: true,
+		}
+		log.Info().
+			Str("sessionId", pamConfig.SessionId).
+			Str("url", credentials.Url).
+			Msg("Starting Web App PAM proxy")
+		return webbrowser.Run(ctx, handlerConn, webCfg, webbrowser.NewSessionLoggerRecorder(sessionLogger))
 	default:
 		return fmt.Errorf("unsupported resource type: %s", pamConfig.ResourceType)
 	}
