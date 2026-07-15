@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,32 +15,26 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-type recorded struct {
-	meta            InteractionMeta
-	before, after   int // byte lengths
-}
-
 type testRecorder struct {
-	ch  chan recorded
-	dir string
+	frames   int64
+	activity chan InteractionMeta
 }
 
-func (r *testRecorder) RecordInteraction(meta InteractionMeta, before, after []byte) {
-	if len(before) > 0 {
-		_ = os.WriteFile(filepath.Join(r.dir, fmt.Sprintf("%d-%s-before.png", meta.ElapsedNs, meta.Type)), before, 0o644)
-	}
-	if len(after) > 0 {
-		_ = os.WriteFile(filepath.Join(r.dir, fmt.Sprintf("%d-%s-after.png", meta.ElapsedNs, meta.Type)), after, 0o644)
-	}
+func (r *testRecorder) RecordFrame(_ int64, _ []byte) {
+	atomic.AddInt64(&r.frames, 1)
+}
+
+func (r *testRecorder) RecordActivity(meta InteractionMeta) {
 	select {
-	case r.ch <- recorded{meta: meta, before: len(before), after: len(after)}:
+	case r.activity <- meta:
 	default:
 	}
 }
 
 // TestWebBrowserEngine drives the CDP engine end-to-end against a local page:
-// it verifies screencast frames flow, a click is dispatched, and before/after
-// screenshots are captured. Requires a local Chrome/Chromium.
+// it verifies screencast frames flow, a click is dispatched, the session video
+// (frames) is recorded, and the click is recorded as an activity. Requires a
+// local Chrome/Chromium.
 //
 //	RUN_WEBBROWSER_TEST=1 go test ./packages/pam/handlers/webbrowser/ -run TestWebBrowserEngine -v
 func TestWebBrowserEngine(t *testing.T) {
@@ -57,9 +50,7 @@ func TestWebBrowserEngine(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dir := filepath.Join(os.TempDir(), "infisical-pam-web-test")
-	_ = os.MkdirAll(dir, 0o755)
-	rec := &testRecorder{ch: make(chan recorded, 16), dir: dir}
+	rec := &testRecorder{activity: make(chan InteractionMeta, 16)}
 
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
@@ -108,29 +99,28 @@ func TestWebBrowserEngine(t *testing.T) {
 	}
 	_ = writeMessage(clientConn, MsgInput, mustJSON(InputEvent{Kind: "mouse", EventType: "up", Button: "left", NX: 0.5, NY: 0.5}))
 
-	// Drain interactions until we see the click, which must carry BOTH a before
-	// and an after screenshot (the core "report" behavior).
+	// Wait for the click to be recorded as an activity.
 	deadline := time.After(20 * time.Second)
 	gotClick := false
 	for !gotClick {
 		select {
-		case r := <-rec.ch:
-			t.Logf("recorded %s interaction (before=%dB after=%dB)", r.meta.Type, r.before, r.after)
-			if r.meta.Type == "click" {
-				if r.before == 0 || r.after == 0 {
-					t.Fatalf("click interaction missing before/after screenshot (before=%d after=%d)", r.before, r.after)
-				}
+		case a := <-rec.activity:
+			t.Logf("recorded activity: %s", a.Type)
+			if a.Type == "click" {
 				gotClick = true
 			}
 		case <-deadline:
-			t.Fatal("no click interaction with before/after recorded")
+			t.Fatal("no click activity recorded")
 		}
 	}
 
 	if n := atomic.LoadInt64(&frames); n == 0 {
-		t.Fatal("no screencast frames received")
+		t.Fatal("no screencast frames received over the wire")
 	}
-	t.Logf("OK: screencast frames=%d; before/after PNGs written to %s", atomic.LoadInt64(&frames), dir)
+	if n := atomic.LoadInt64(&rec.frames); n == 0 {
+		t.Fatal("no video frames recorded")
+	}
+	t.Logf("OK: wire frames=%d, recorded video frames=%d", atomic.LoadInt64(&frames), atomic.LoadInt64(&rec.frames))
 }
 
 // TestChromedpNav isolates Chromium launch + navigation from the protocol code.

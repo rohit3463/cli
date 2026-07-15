@@ -33,11 +33,12 @@ type InteractionMeta struct {
 	ElapsedNs int64   `json:"elapsedNs"`
 }
 
-// Recorder receives before/after screenshots for each meaningful interaction.
-// The gateway implements it against the PAM SessionLogger; the test harness
-// implements it by writing PNGs to disk.
+// Recorder captures the session as a video (every screencast frame) plus a
+// timeline of activity events (clicks/keys/navigation). The gateway implements
+// it against the PAM SessionLogger; the test harness collects them in memory.
 type Recorder interface {
-	RecordInteraction(meta InteractionMeta, beforePNG, afterPNG []byte)
+	RecordFrame(elapsedNs int64, jpeg []byte)
+	RecordActivity(meta InteractionMeta)
 }
 
 // Config parameterizes a web session.
@@ -52,7 +53,8 @@ type Config struct {
 	ChromePath string // optional; empty = chromedp auto-detect
 }
 
-const settleDelay = 400 * time.Millisecond
+// Recorded frames are throttled to bound recording size; the live view stays full-rate.
+const minRecordFrameInterval = 120 * time.Millisecond
 
 func (c *Config) applyDefaults() {
 	if c.Width == 0 {
@@ -159,14 +161,8 @@ func Run(ctx context.Context, conn io.ReadWriter, cfg Config, rec Recorder) erro
 
 	elapsed := func() int64 { return time.Since(startedAt).Nanoseconds() }
 
-	captureAfter := func(meta InteractionMeta, before []byte) {
-		time.Sleep(settleDelay)
-		var after []byte
-		_ = runCDP(chromedp.CaptureScreenshot(&after))
-		rec.RecordInteraction(meta, before, after)
-	}
-
 	var frameCount int64
+	var lastRecordedFrame time.Time
 	chromedp.ListenTarget(cdpCtx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *page.EventScreencastFrame:
@@ -181,15 +177,17 @@ func Run(ctx context.Context, conn io.ReadWriter, cfg Config, rec Recorder) erro
 			if data, derr := base64.StdEncoding.DecodeString(e.Data); derr == nil {
 				frameCount++
 				if frameCount == 1 || frameCount%30 == 0 {
-					m := e.Metadata
-					evt := log.Info().Int64("frames", frameCount).Int("bytes", len(data))
-					if m != nil {
-						evt = evt.Float64("devW", m.DeviceWidth).Float64("devH", m.DeviceHeight).
-							Float64("pageScale", m.PageScaleFactor).Float64("offsetTop", m.OffsetTop)
-					}
-					evt.Msg("webbrowser: screencast frame")
+					log.Info().Int64("frames", frameCount).Int("bytes", len(data)).Msg("webbrowser: screencast frame")
 				}
 				sendFrame(data)
+				// Record the frame as part of the session video (throttled to bound size).
+				if rec != nil {
+					now := time.Now()
+					if lastRecordedFrame.IsZero() || now.Sub(lastRecordedFrame) >= minRecordFrameInterval {
+						lastRecordedFrame = now
+						rec.RecordFrame(elapsed(), data)
+					}
+				}
 			}
 			sid := e.SessionID
 			go func() { _ = runCDP(page.ScreencastFrameAck(sid)) }()
@@ -201,8 +199,7 @@ func Run(ctx context.Context, conn io.ReadWriter, cfg Config, rec Recorder) erro
 				url := e.Frame.URL
 				sendControl(mustJSON(ControlMsg{Kind: "navigated", URL: url}))
 				if rec != nil {
-					meta := InteractionMeta{Type: "navigate", URL: url, ElapsedNs: elapsed()}
-					go captureAfter(meta, nil)
+					rec.RecordActivity(InteractionMeta{Type: "navigate", URL: url, ElapsedNs: elapsed()})
 				}
 			}
 		case *fetch.EventAuthRequired:
@@ -287,7 +284,7 @@ func Run(ctx context.Context, conn io.ReadWriter, cfg Config, rec Recorder) erro
 					Str("key", ev.Key).
 					Msg("webbrowser: input")
 			}
-			dispatchInput(runCDP, viewport, ev, rec, elapsed, captureAfter)
+			dispatchInput(runCDP, viewport, ev, rec, elapsed)
 		}
 	}()
 
@@ -307,7 +304,6 @@ func dispatchInput(
 	ev InputEvent,
 	rec Recorder,
 	elapsed func() int64,
-	captureAfter func(InteractionMeta, []byte),
 ) {
 	w, h := viewport()
 	x := ev.NX * w
@@ -323,14 +319,10 @@ func dispatchInput(
 		if mt == input.MousePressed || mt == input.MouseReleased {
 			p = p.WithClickCount(1)
 		}
-		if rec != nil && ev.EventType == "down" && ev.Button != "none" {
-			var before []byte
-			_ = runCDP(chromedp.CaptureScreenshot(&before))
-			_ = runCDP(p)
-			go captureAfter(InteractionMeta{Type: "click", NX: ev.NX, NY: ev.NY, ElapsedNs: elapsed()}, before)
-			return
-		}
 		_ = runCDP(p)
+		if rec != nil && ev.EventType == "down" && ev.Button != "none" {
+			rec.RecordActivity(InteractionMeta{Type: "click", NX: ev.NX, NY: ev.NY, ElapsedNs: elapsed()})
+		}
 
 	case "wheel":
 		_ = runCDP(input.DispatchMouseEvent(input.MouseWheel, x, y).WithDeltaX(ev.DeltaX).WithDeltaY(ev.DeltaY))
@@ -341,14 +333,10 @@ func dispatchInput(
 			return
 		}
 		p := input.DispatchKeyEvent(kt).WithKey(ev.Key).WithCode(ev.Code).WithText(ev.Text).WithModifiers(input.Modifier(ev.Modifiers))
-		if rec != nil && ev.EventType == "down" && ev.Key == "Enter" {
-			var before []byte
-			_ = runCDP(chromedp.CaptureScreenshot(&before))
-			_ = runCDP(p)
-			go captureAfter(InteractionMeta{Type: "key", Key: ev.Key, ElapsedNs: elapsed()}, before)
-			return
-		}
 		_ = runCDP(p)
+		if rec != nil && ev.EventType == "down" && ev.Key != "" {
+			rec.RecordActivity(InteractionMeta{Type: "key", Key: ev.Key, ElapsedNs: elapsed()})
+		}
 	}
 	// "resize" is intentionally not handled in this phase; the viewport is locked.
 }
